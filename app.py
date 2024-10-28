@@ -13,12 +13,13 @@ app.prepare(ctx_id=0, det_size=(640, 640))
 # Load the face swapper model
 swapper = insightface.model_zoo.get_model('inswapper_128.onnx', download=False, download_zip=False)
 
-def swap_faces_in_video(image, video):
+def swap_faces_in_video(image, video, progress):
     """
     Swaps faces from a source image with faces detected in a video and returns the path to the output video file.
     
     image: Source image (as an array)
     video: Path to the input video file
+    progress: Streamlit progress object
     """
     source_faces = app.get(image)
 
@@ -35,6 +36,7 @@ def swap_faces_in_video(image, video):
     cap = cv2.VideoCapture(video)
 
     # Get video properties for output
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -43,7 +45,7 @@ def swap_faces_in_video(image, video):
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
     out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
-    while True:
+    for i in range(frame_count):
         ret, frame = cap.read()
         if not ret:
             break  # Exit if the video is finished
@@ -60,6 +62,9 @@ def swap_faces_in_video(image, video):
 
         # Write the result frame to the output video
         out.write(result_frame)
+
+        # Update progress bar
+        progress.progress((i + 1) / frame_count)
 
     # Release resources
     cap.release()
@@ -87,9 +92,10 @@ if st.button("Swap Faces"):
             tmp_video.write(video_file.read())
             tmp_video_path = tmp_video.name
 
-        # Show a spinner while processing
+        # Show a spinner and a progress bar while processing
         with st.spinner("Processing video..."):
-            output_video_path = swap_faces_in_video(source_image, tmp_video_path)
+            progress_bar = st.progress(0)
+            output_video_path = swap_faces_in_video(source_image, tmp_video_path, progress_bar)
 
         if output_video_path:
             st.success("Face swapping completed!")
