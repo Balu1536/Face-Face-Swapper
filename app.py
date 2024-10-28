@@ -99,8 +99,21 @@ if st.button("Swap Faces"):
 
         if output_video_path:
             st.success("Face swapping completed!")
+            # Play the processed video in Streamlit
             st.video(output_video_path)
+
+            # Provide an option to download the processed video
+            with open(output_video_path, "rb") as f:
+                st.download_button(
+                    label="Download Processed Video",
+                    data=f,
+                    file_name="output_swapped_video.avi",
+                    mime="video/x-msvideo"
+                )
+
+            # Clean up temporary files
             os.remove(tmp_video_path)  # Clean up temporary video file
-            os.remove(output_video_path)  # Clean up output video file if needed
+            # Optionally, keep the output video after displaying
+            # os.remove(output_video_path)  # Uncomment to delete after displaying
     else:
         st.error("Please upload both an image and a video.")
