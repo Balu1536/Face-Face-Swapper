@@ -1,4 +1,8 @@
+import os
+os.environ["STREAMLIT_SERVER_ENABLECORS"] = "false"
+os.environ["STREAMLIT_SERVER_ENABLEWEBSOCKETCOMPRESSION"] = "false"
 import streamlit as st
+
 import numpy as np
 import cv2
 import insightface
