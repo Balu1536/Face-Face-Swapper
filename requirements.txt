@@ -2,4 +2,9 @@ opencv-python
 matplotlib
 insightface
 onnxruntime
+streamlittorch
+torchvision
+opencv-python
+moviepy
+numpy
 streamlit
