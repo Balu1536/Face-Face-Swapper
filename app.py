@@ -25,7 +25,7 @@ def _has_cuda():
 # Page & Sidebar (controls for speed)
 # -----------------------------------
 st.set_page_config(page_title="Face Swapper", layout="centered")
-st.title("🎭 Face Swapper in Video")
+st.title("🎭 Savvy Long Video Swapper")
 
 st.sidebar.title("⚙️ Settings")
 
