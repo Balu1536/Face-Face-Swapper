@@ -1,12 +1,12 @@
-opencv-python
+opencv-python-headless==4.10.0.84
 matplotlib
-insightface
-onnxruntime
-streamlittorch
-torchvision
-moviepy
-numpy
+insightface==0.7.3
+onnxruntime==1.22.1
 streamlit
-torch==2.2.2
-torchvision==0.17.2
-torchaudio==2.2.2
+numpy
+moviepy
+
+# Torch with CUDA 11.8 support (works on Hugging Face T4 GPUs)
+torch==2.2.2+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+torchvision==0.17.2+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+torchaudio==2.2.2+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
