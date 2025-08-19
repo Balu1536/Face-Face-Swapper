@@ -1,11 +1,8 @@
 opencv-python-headless==4.10.0.84
-matplotlib
 insightface==0.7.3
-onnxruntime==1.22.1
-streamlit
+onnxruntime>=1.17.0
+# If your Space has GPU runner enabled, ORT will still work via CPU if CUDA provider is missing.
+# If you want to force GPU provider when available, you can add:
+# onnxruntime-gpu>=1.17.0; platform_system == "Linux" and platform_machine == "x86_64"
+streamlit>=1.33.0
 numpy
-moviepy
-
-torch==2.2.2
-torchvision==0.17.2
-torchaudio==2.2.2
