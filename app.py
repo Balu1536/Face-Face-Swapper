@@ -12,6 +12,8 @@ import numpy as np
 import cv2
 import tempfile
 import traceback
+from PIL import Image
+import io
 
 # -------------------------
 # VERY EARLY: initialize session state
@@ -20,7 +22,10 @@ import traceback
 for key, default in {
     "uploaded_image": None,
     "uploaded_video": None,
+    "uploaded_target_image": None,
     "output_video": None,
+    "output_image": None,
+    "mode": "video",  # 'video' or 'image'
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -40,7 +45,11 @@ def _has_cuda():
 # Page & Sidebar (controls for speed)
 # -----------------------------------
 st.set_page_config(page_title="Face Swapper", layout="centered")
-st.title("🎭 Savvy Long Video Swapper")
+st.title("🎭 Savvy Face Swapper")
+
+# Mode selection
+mode = st.radio("Select Mode:", ["Video", "Image"], horizontal=True)
+st.session_state.mode = mode.lower()
 
 st.sidebar.title("⚙️ Settings")
 
@@ -52,20 +61,22 @@ proc_res = st.sidebar.selectbox(
     help="Frames are resized before detection/swap. Lower = faster."
 )
 
-# Skip frames to hit a lower effective FPS
-fps_cap = st.sidebar.selectbox(
-    "Target FPS",
-    ["Original", "24", "15"],
-    index=0,
-    help="Lower target FPS drops frames during processing for speed."
-)
+# For video mode only
+if st.session_state.mode == "video":
+    # Skip frames to hit a lower effective FPS
+    fps_cap = st.sidebar.selectbox(
+        "Target FPS",
+        ["Original", "24", "15"],
+        index=0,
+        help="Lower target FPS drops frames during processing for speed."
+    )
 
-# Keep the original output resolution even if we process smaller
-keep_original_res = st.sidebar.checkbox(
-    "Keep original output resolution",
-    value=False,
-    help="If enabled, processed frames are upscaled back to the input size."
-)
+    # Keep the original output resolution even if we process smaller
+    keep_original_res = st.sidebar.checkbox(
+        "Keep original output resolution",
+        value=False,
+        help="If enabled, processed frames are upscaled back to the input size."
+    )
 
 # Limit faces per frame (helps speed on crowded scenes)
 max_faces = st.sidebar.slider(
@@ -124,7 +135,8 @@ with st.spinner("Loading models…"):
         app, swapper, providers, ctx_id = load_models()
     except Exception as e:
         st.error("❌ Model loading failed. See logs for details.")
-        raise
+        st.error(str(e))
+        st.stop()
 
 st.caption(
     f"Device: {'GPU (CUDA)' if ctx_id == 0 else 'CPU'} • ORT Providers: {', '.join(providers)}"
@@ -168,9 +180,90 @@ def _safe_imdecode(file_bytes):
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     return img
 
+def _cv2_to_pil(image):
+    """Convert OpenCV BGR image to PIL RGB image"""
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(image_rgb)
+
+def _pil_to_cv2(image):
+    """Convert PIL RGB image to OpenCV BGR image"""
+    return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
 # -------------------------------------
-# Core: face swap over an input video
+# Core: face swap functions
 # -------------------------------------
+def swap_faces_in_image(
+    source_image_bgr: np.ndarray,
+    target_image_bgr: np.ndarray,
+    proc_res: str,
+    max_faces: int
+):
+    # Validate source image
+    try:
+        source_faces = app.get(source_image_bgr)
+    except Exception as e:
+        st.error(f"❌ FaceAnalysis failed on source image: {e}")
+        return None
+
+    if not source_faces:
+        st.error("❌ No face detected in the source image.")
+        return None
+
+    # Use the largest detected face
+    source_face = max(
+        source_faces,
+        key=lambda f: max(1, int((f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1])))
+    )
+
+    # Get processing size
+    orig_h, orig_w = target_image_bgr.shape[:2]
+    proc_w, proc_h = _get_proc_size_choice(orig_w, orig_h, proc_res)
+    
+    # Resize target image for processing
+    if (proc_w, proc_h) != (orig_w, orig_h):
+        target_image_proc = cv2.resize(target_image_bgr, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
+    else:
+        target_image_proc = target_image_bgr.copy()
+
+    try:
+        # Detect faces on target image
+        try:
+            target_faces = app.get(target_image_proc)
+        except Exception as det_e:
+            st.error(f"[ERROR] Detection failed on target image: {det_e}")
+            target_faces = []
+
+        if not target_faces:
+            st.warning("⚠️ No faces detected in the target image.")
+            return _cv2_to_pil(target_image_bgr)
+
+        # Optionally limit faces to largest N
+        target_faces = sorted(
+            target_faces,
+            key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]),
+            reverse=True
+        )[:max_faces]
+
+        # Swap faces
+        result_image = target_image_proc.copy()
+        for tface in target_faces:
+            try:
+                result_image = swapper.get(result_image, tface, source_face, paste_back=True)
+            except Exception as swap_e:
+                st.error(f"Face swap error: {swap_e}")
+                continue
+
+        # Resize back to original if needed
+        if (proc_w, proc_h) != (orig_w, orig_h):
+            result_image = cv2.resize(result_image, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+
+        return _cv2_to_pil(result_image)
+
+    except Exception as e:
+        st.error(f"❌ Error processing image: {e}")
+        traceback.print_exc()
+        return _cv2_to_pil(target_image_bgr)
+
 def swap_faces_in_video(
     image_bgr: np.ndarray,
     video_path: str,
@@ -191,13 +284,7 @@ def swap_faces_in_video(
         st.error("❌ No face detected in the source image.")
         return None
 
-    # Use the largest detected face if there are multiple
-    source_face = max(
-        source_faces,
-        key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[1]-f.bbox[3])  # absolute area doesn't depend on sign but keep positive
-        if hasattr(f, "bbox") else 0
-    )
-    # (safer area) re-compute properly
+    # Use the largest detected face
     source_face = max(
         source_faces,
         key=lambda f: max(1, int((f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1])))
@@ -286,14 +373,10 @@ def swap_faces_in_video(
                 result_frame = proc_frame.copy()
                 for tface in target_faces:
                     try:
-                        # Some insightface builds want base=proc_frame, some allow in-place
-                        result_frame = swapper.get(
-                            proc_frame, tface, source_face, paste_back=True
-                        )
-                    except Exception:
-                        result_frame = swapper.get(
-                            result_frame, tface, source_face, paste_back=True
-                        )
+                        result_frame = swapper.get(result_frame, tface, source_face, paste_back=True)
+                    except Exception as swap_e:
+                        print(f"[WARN] Face swap failed on frame {read_idx}: {swap_e}")
+                        continue
 
                 # Upscale back to original if requested
                 if keep_original_res and (proc_w, proc_h) != (orig_w, orig_h):
@@ -320,6 +403,9 @@ def swap_faces_in_video(
                 # Fallback progress for unknown frame counts
                 progress.progress(min(1.0, (processed_frames % 300) / 300.0))
 
+    except Exception as e:
+        st.error(f"❌ Error during video processing: {e}")
+        traceback.print_exc()
     finally:
         cap.release()
         out.release()
@@ -329,28 +415,36 @@ def swap_faces_in_video(
 # -------------------------
 # UI: Uploads & Preview
 # -------------------------
-st.write("Upload a **source face image** and a **target video**, preview them, tweak speed options, then start swapping.")
+st.write("Upload a **source face image** and a **target**, preview them, tweak options, then start swapping.")
 
 image_file = st.file_uploader("Upload Source Image", type=["jpg", "jpeg", "png"])
-video_file = st.file_uploader("Upload Target Video", type=["mp4", "mov", "mkv", "avi"])
 
-# Previews (Streamlit handles these safely)
+if st.session_state.mode == "video":
+    target_file = st.file_uploader("Upload Target Video", type=["mp4", "mov", "mkv", "avi"])
+else:
+    target_file = st.file_uploader("Upload Target Image", type=["jpg", "jpeg", "png"])
+
+# Previews
 if image_file:
     st.subheader("📷 Source Image Preview")
     st.image(image_file, caption="Source Image", use_column_width=True)
 
-if video_file:
-    st.subheader("🎬 Target Video Preview")
-    st.video(video_file)
+if target_file:
+    if st.session_state.mode == "video":
+        st.subheader("🎬 Target Video Preview")
+        st.video(target_file)
+    else:
+        st.subheader("🖼️ Target Image Preview")
+        st.image(target_file, caption="Target Image", use_column_width=True)
 
 # -------------------------
 # Run button
 # -------------------------
 if st.button("🚀 Start Face Swap"):
-    if not image_file or not video_file:
-        st.error("⚠️ Please upload both a source image and a target video.")
+    if not image_file or not target_file:
+        st.error("⚠️ Please upload both a source image and a target.")
     else:
-        # Read uploads safely (do not consume file pointer used by preview)
+        # Read source image
         try:
             image_bytes = image_file.getvalue()
             source_image = _safe_imdecode(image_bytes)
@@ -361,51 +455,89 @@ if st.button("🚀 Start Face Swap"):
             st.error(f"❌ Failed to read the source image bytes: {e}")
             st.stop()
 
-        try:
-            # Persist temp video for OpenCV
-            video_bytes = video_file.getvalue()
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
-                tmp_video.write(video_bytes)
-                tmp_video_path = tmp_video.name
-        except Exception as e:
-            st.error(f"❌ Failed to save the uploaded video to a temp file: {e}")
-            st.stop()
-
-        with st.spinner("Processing video… This can take a while ⏳"):
-            progress_bar = st.progress(0)
-            output_video_path = swap_faces_in_video(
-                source_image,
-                tmp_video_path,
-                proc_res=proc_res,
-                fps_cap=fps_cap,
-                keep_original_res=keep_original_res,
-                max_faces=max_faces,
-                progress=progress_bar
-            )
-
-        if output_video_path:
-            st.success("✅ Face swapping completed!")
-
-            st.subheader("📺 Output Video Preview")
-            st.video(output_video_path)
-
-            # Download button
+        if st.session_state.mode == "video":
+            # Process video
             try:
-                with open(output_video_path, "rb") as f:
-                    st.download_button(
-                        label="⬇️ Download Processed Video",
-                        data=f,
-                        file_name="output_swapped_video.mp4",
-                        mime="video/mp4"
-                    )
+                # Persist temp video for OpenCV
+                video_bytes = target_file.getvalue()
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
+                    tmp_video.write(video_bytes)
+                    tmp_video_path = tmp_video.name
             except Exception as e:
-                st.warning(f"⚠️ Could not open the output file for download: {e}")
+                st.error(f"❌ Failed to save the uploaded video to a temp file: {e}")
+                st.stop()
 
-        # Cleanup temp input video; keep output so it can be downloaded
-        try:
-            os.remove(tmp_video_path)
-        except Exception:
-            pass
+            with st.spinner("Processing video… This can take a while ⏳"):
+                progress_bar = st.progress(0)
+                output_path = swap_faces_in_video(
+                    source_image,
+                    tmp_video_path,
+                    proc_res=proc_res,
+                    fps_cap=fps_cap,
+                    keep_original_res=keep_original_res,
+                    max_faces=max_faces,
+                    progress=progress_bar
+                )
+
+            if output_path:
+                st.success("✅ Face swapping completed!")
+                st.subheader("📺 Output Video Preview")
+                st.video(output_path)
+
+                # Download button
+                try:
+                    with open(output_path, "rb") as f:
+                        st.download_button(
+                            label="⬇️ Download Processed Video",
+                            data=f,
+                            file_name="output_swapped_video.mp4",
+                            mime="video/mp4"
+                        )
+                except Exception as e:
+                    st.warning(f"⚠️ Could not open the output file for download: {e}")
+
+            # Cleanup temp input video
+            try:
+                os.remove(tmp_video_path)
+            except Exception:
+                pass
+
+        else:
+            # Process image
+            try:
+                target_bytes = target_file.getvalue()
+                target_image = _safe_imdecode(target_bytes)
+                if target_image is None:
+                    st.error("❌ Failed to decode target image. Please use a valid JPG/PNG.")
+                    st.stop()
+            except Exception as e:
+                st.error(f"❌ Failed to read the target image bytes: {e}")
+                st.stop()
+
+            with st.spinner("Processing image…"):
+                result_image = swap_faces_in_image(
+                    source_image,
+                    target_image,
+                    proc_res=proc_res,
+                    max_faces=max_faces
+                )
+
+            if result_image:
+                st.success("✅ Face swapping completed!")
+                st.subheader("🖼️ Output Image Preview")
+                st.image(result_image, caption="Result Image", use_column_width=True)
+
+                # Download button
+                buf = io.BytesIO()
+                result_image.save(buf, format="JPEG")
+                byte_im = buf.getvalue()
+                
+                st.download_button(
+                    label="⬇️ Download Processed Image",
+                    data=byte_im,
+                    file_name="output_swapped_image.jpg",
+                    mime="image/jpeg"
+                )
 
 # -------------
 # Diagnostics
