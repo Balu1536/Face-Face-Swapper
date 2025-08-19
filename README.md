@@ -4,7 +4,7 @@ emoji: 😻
 colorFrom: gray
 colorTo: indigo
 sdk: streamlit
-sdk_version: 1.39.0
+sdk_version: 1.48.1
 app_file: app.py
 pinned: false
 license: mit
