@@ -1,5 +1,5 @@
 # =========================
-# app.py  (production-ready)
+# app.py  (production-ready, safer)
 # =========================
 import os
 
@@ -13,12 +13,27 @@ import cv2
 import tempfile
 import traceback
 
-# Lazy imports for heavy libs inside cached loaders to avoid early session init issues
+# -------------------------
+# VERY EARLY: initialize session state
+# -------------------------
+# This prevents the "SessionInfo before it was initialized" glitch on some boots
+for key, default in {
+    "uploaded_image": None,
+    "uploaded_video": None,
+    "output_video": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# -------------------------
+# GPU check (optional torch import)
+# -------------------------
 def _has_cuda():
     try:
         import torch
         return torch.cuda.is_available()
     except Exception:
+        # If torch isn't installed, just say no CUDA
         return False
 
 # -----------------------------------
@@ -66,34 +81,50 @@ def load_models():
     """
     Load InsightFace detectors and the inswapper model once.
     Auto-select GPU if available, else CPU.
+    Be tolerant of insightface versions (providers kwarg may not exist).
     """
-    # Defer heavy imports until Streamlit session is ready
     import insightface
     from insightface.app import FaceAnalysis
 
-    # Providers for ONNX Runtime (insightface uses ORT under the hood)
-    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if _has_cuda() else ["CPUExecutionProvider"]
+    # Desired providers for ORT
+    wants_cuda = _has_cuda()
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if wants_cuda else ["CPUExecutionProvider"]
 
     # Face detector/landmarks (retinaface + arcface in buffalo_l)
+    ctx_id = 0 if wants_cuda else -1
     app = FaceAnalysis(name="buffalo_l")
-    # ctx_id: 0 (GPU) or -1 (CPU)
-    ctx_id = 0 if _has_cuda() else -1
     app.prepare(ctx_id=ctx_id, det_size=(640, 640))
 
     # Face swapper (inswapper_128)
-    # Let insightface download the model if not present
-    swapper = insightface.model_zoo.get_model(
-        "inswapper_128.onnx",
-        download=True,
-        download_zip=False,
-        providers=providers
-    )
+    # Some insightface versions accept providers=..., some don't.
+    swapper = None
+    try:
+        swapper = insightface.model_zoo.get_model(
+            "inswapper_128.onnx",
+            download=True,
+            download_zip=False,
+            providers=providers
+        )
+    except TypeError:
+        # Fallback path: older insightface without providers kwarg
+        swapper = insightface.model_zoo.get_model(
+            "inswapper_128.onnx",
+            download=True,
+            download_zip=False
+        )
+    except Exception as e:
+        # Last resort: surface a helpful error
+        raise RuntimeError(f"Failed to load inswapper_128.onnx: {e}")
 
     return app, swapper, providers, ctx_id
 
 # Initialize models
 with st.spinner("Loading models…"):
-    app, swapper, providers, ctx_id = load_models()
+    try:
+        app, swapper, providers, ctx_id = load_models()
+    except Exception as e:
+        st.error("❌ Model loading failed. See logs for details.")
+        raise
 
 st.caption(
     f"Device: {'GPU (CUDA)' if ctx_id == 0 else 'CPU'} • ORT Providers: {', '.join(providers)}"
@@ -122,14 +153,15 @@ def _parse_fps_cap(original_fps, cap_choice):
     if not original_fps or original_fps <= 0:
         original_fps = 25.0
     if cap_choice == "Original":
-        return original_fps, 1  # write_fps, frame_step
+        return max(1.0, original_fps), 1  # write_fps, frame_step
     try:
         tgt = float(cap_choice)
+        tgt = max(1.0, tgt)
         step = max(1, int(round(original_fps / tgt)))
-        write_fps = original_fps / step
+        write_fps = max(1.0, original_fps / step)
         return write_fps, step
     except Exception:
-        return original_fps, 1
+        return max(1.0, original_fps), 1
 
 def _safe_imdecode(file_bytes):
     arr = np.frombuffer(file_bytes, np.uint8)
@@ -149,7 +181,12 @@ def swap_faces_in_video(
     progress
 ):
     # Validate source image
-    source_faces = app.get(image_bgr)
+    try:
+        source_faces = app.get(image_bgr)
+    except Exception as e:
+        st.error(f"❌ FaceAnalysis failed on source image: {e}")
+        return None
+
     if not source_faces:
         st.error("❌ No face detected in the source image.")
         return None
@@ -157,7 +194,13 @@ def swap_faces_in_video(
     # Use the largest detected face if there are multiple
     source_face = max(
         source_faces,
-        key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1])
+        key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[1]-f.bbox[3])  # absolute area doesn't depend on sign but keep positive
+        if hasattr(f, "bbox") else 0
+    )
+    # (safer area) re-compute properly
+    source_face = max(
+        source_faces,
+        key=lambda f: max(1, int((f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1])))
     )
 
     # Open video
@@ -170,7 +213,9 @@ def swap_faces_in_video(
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    orig_fps = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
+    orig_fps = float(cap.get(cv2.CAP_PROP_FPS))
+    if orig_fps <= 0 or np.isnan(orig_fps):
+        orig_fps = 25.0
 
     # Decide processing size & FPS behavior
     proc_w, proc_h = _get_proc_size_choice(orig_w, orig_h, proc_res)
@@ -181,12 +226,14 @@ def swap_faces_in_video(
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_out:
         output_path = tmp_out.name
 
-    # `mp4v` is widely compatible on Spaces/desktop browsers
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(output_path, fourcc, write_fps, (out_w, out_h))
     if not out.isOpened():
         cap.release()
-        st.error("❌ Failed to open VideoWriter. Try a different resolution/FPS setting.")
+        st.error(
+            "❌ Failed to open VideoWriter. "
+            "Try setting Processing Resolution to 480p or Target FPS to 24."
+        )
         return None
 
     st.info(
@@ -207,161 +254,4 @@ def swap_faces_in_video(
                 break
 
             # FPS cap by skipping frames
-            if frame_step > 1 and (read_idx % frame_step != 0):
-                read_idx += 1
-                if frame_count > 0:
-                    progress.progress(min(1.0, read_idx / frame_count))
-                continue
-
-            # Resize for processing
-            if (proc_w, proc_h) != (orig_w, orig_h):
-                proc_frame = cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
-            else:
-                proc_frame = frame
-
-            try:
-                # Detect faces on processed frame
-                target_faces = app.get(proc_frame)
-
-                if target_faces:
-                    # Optionally limit faces to largest N for speed
-                    target_faces = sorted(
-                        target_faces,
-                        key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]),
-                        reverse=True
-                    )[:max_faces]
-
-                # Swap into a working buffer
-                result_frame = proc_frame.copy()
-                for tface in target_faces:
-                    # Two-call fallback for different insightface versions
-                    try:
-                        result_frame = swapper.get(
-                            proc_frame, tface, source_face, paste_back=True
-                        )
-                    except Exception:
-                        result_frame = swapper.get(
-                            result_frame, tface, source_face, paste_back=True
-                        )
-
-                # Upscale back to original if requested
-                if keep_original_res and (proc_w, proc_h) != (orig_w, orig_h):
-                    result_frame = cv2.resize(result_frame, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
-
-                out.write(result_frame)
-
-            except Exception as e:
-                # Log & write fallback frame (processed size or original size)
-                print(f"[WARN] Frame {read_idx} failed: {e}")
-                traceback.print_exc()
-                fallback = proc_frame
-                if keep_original_res and (proc_w, proc_h) != (orig_w, orig_h):
-                    fallback = cv2.resize(proc_frame, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
-                out.write(fallback)
-
-            read_idx += 1
-            processed_frames += 1
-
-            # Update progress
-            if frame_count > 0:
-                progress.progress(min(1.0, read_idx / frame_count))
-            elif processed_frames % 30 == 0:
-                # Fallback progress for unknown frame counts
-                progress.progress(min(1.0, (processed_frames % 300) / 300.0))
-
-    finally:
-        cap.release()
-        out.release()
-
-    return output_path
-
-# -------------------------
-# UI: Uploads & Preview
-# -------------------------
-st.write("Upload a **source face image** and a **target video**, preview them, tweak speed options, then start swapping.")
-
-image_file = st.file_uploader("Upload Source Image", type=["jpg", "jpeg", "png"])
-video_file = st.file_uploader("Upload Target Video", type=["mp4", "mov", "mkv", "avi"])
-
-# Previews
-if image_file:
-    st.subheader("📷 Source Image Preview")
-    st.image(image_file, caption="Source Image", use_column_width=True)
-
-if video_file:
-    st.subheader("🎬 Target Video Preview")
-    st.video(video_file)
-
-# -------------------------
-# Run button
-# -------------------------
-if st.button("🚀 Start Face Swap"):
-    if not image_file or not video_file:
-        st.error("⚠️ Please upload both a source image and a target video.")
-    else:
-        # Read uploads safely (do not consume file pointer used by preview)
-        try:
-            image_bytes = image_file.getvalue()
-            source_image = _safe_imdecode(image_bytes)
-            if source_image is None:
-                st.error("❌ Failed to decode source image. Please use a valid JPG/PNG.")
-                st.stop()
-        except Exception:
-            st.error("❌ Failed to read the source image bytes.")
-            st.stop()
-
-        try:
-            video_bytes = video_file.getvalue()
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
-                tmp_video.write(video_bytes)
-                tmp_video_path = tmp_video.name
-        except Exception:
-            st.error("❌ Failed to save the uploaded video to a temp file.")
-            st.stop()
-
-        with st.spinner("Processing video… This can take a while ⏳"):
-            progress_bar = st.progress(0)
-            output_video_path = swap_faces_in_video(
-                source_image,
-                tmp_video_path,
-                proc_res=proc_res,
-                fps_cap=fps_cap,
-                keep_original_res=keep_original_res,
-                max_faces=max_faces,
-                progress=progress_bar
-            )
-
-        if output_video_path:
-            st.success("✅ Face swapping completed!")
-
-            st.subheader("📺 Output Video Preview")
-            st.video(output_video_path)
-
-            # Download button
-            try:
-                with open(output_video_path, "rb") as f:
-                    st.download_button(
-                        label="⬇️ Download Processed Video",
-                        data=f,
-                        file_name="output_swapped_video.mp4",
-                        mime="video/mp4"
-                    )
-            except Exception:
-                st.warning("⚠️ Could not open the output file for download.")
-
-        # Cleanup temp input video; keep output so it can be downloaded
-        try:
-            os.remove(tmp_video_path)
-        except Exception:
-            pass
-
-# -------------
-# Diagnostics
-# -------------
-with st.expander("🩺 Diagnostics"):
-    st.write(
-        "- If you see **SessionInfo** errors: this app defers heavy imports via `@st.cache_resource` "
-        "so Streamlit initializes first. If errors persist, restart the runtime.\n"
-        "- If output is jumpy/stutters: lower **Target FPS** or choose **480p** processing.\n"
-        "- If video fails to open: re-encode your input to **MP4 (H.264, AAC)**."
-    )
+            if frame_step > 1 and (re_
