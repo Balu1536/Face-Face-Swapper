@@ -8,7 +8,6 @@ import cv2
 import insightface
 from insightface.app import FaceAnalysis
 import tempfile
-import os
 
 st.set_page_config(page_title="Face Swapper", layout="centered")
 
@@ -41,44 +40,56 @@ app, swapper = load_models(ctx_id)
 # ------------------------------
 def swap_faces_in_video(image, video, progress):
     source_faces = app.get(image)
-    if len(source_faces) == 0:
+    if not source_faces:
         st.error("❌ No face detected in the source image.")
         return None
 
-    source_face = source_faces[0]
+    # Use largest face if multiple
+    source_face = max(source_faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
 
-    # Temporary output file (MP4 for better compatibility)
+    # Temporary output file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_out:
         output_path = tmp_out.name
 
     cap = cv2.VideoCapture(video)
+    if not cap.isOpened():
+        st.error("❌ Could not open video file.")
+        return None
 
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
 
     # MP4 writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
     i = 0
-    while cap.isOpened():
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        target_faces = app.get(frame)
-        result_frame = frame.copy()
+        try:
+            target_faces = app.get(frame)
+            result_frame = frame.copy()
 
-        for target_face in target_faces:
-            # depending on insightface version, frame or result_frame may be needed
-            try:
-                result_frame = swapper.get(frame, target_face, source_face, paste_back=True)
-            except:
-                result_frame = swapper.get(result_frame, target_face, source_face, paste_back=True)
+            for target_face in target_faces:
+                try:
+                    result_frame = swapper.get(
+                        frame, target_face, source_face, paste_back=True
+                    )
+                except Exception:
+                    result_frame = swapper.get(
+                        result_frame, target_face, source_face, paste_back=True
+                    )
 
-        out.write(result_frame)
+            out.write(result_frame)
+
+        except Exception as e:
+            # Skip problematic frame
+            print(f"⚠️ Frame {i} skipped due to error: {e}")
 
         i += 1
         if frame_count > 0:
@@ -110,12 +121,15 @@ if video_file:
 # Button to process
 if st.button("🚀 Start Face Swap"):
     if image_file and video_file:
+        # Use .getvalue() instead of .read() (safe for multiple access)
+        image_bytes = image_file.getvalue()
         source_image = cv2.imdecode(
-            np.frombuffer(image_file.read(), np.uint8), cv2.IMREAD_COLOR
+            np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR
         )
 
+        video_bytes = video_file.getvalue()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
-            tmp_video.write(video_file.read())
+            tmp_video.write(video_bytes)
             tmp_video_path = tmp_video.name
 
         with st.spinner("Processing video... Please wait ⏳"):
@@ -135,9 +149,7 @@ if st.button("🚀 Start Face Swap"):
                     mime="video/mp4"
                 )
 
-            # Cleanup
+            # Cleanup temp input (keep output so it can be downloaded)
             os.remove(tmp_video_path)
-            # Optionally delete output file after preview
-            # os.remove(output_video_path)
     else:
         st.error("⚠️ Please upload both a source image and a video.")
